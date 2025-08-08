@@ -6,6 +6,10 @@
 (define-constant err-dataset-exists (err u104))
 (define-constant err-invalid-price (err u105))
 
+(define-constant err-already-rated (err u106))
+(define-constant err-invalid-rating (err u107))
+(define-constant err-no-access-history (err u108))
+
 (define-data-var next-dataset-id uint u1)
 (define-data-var platform-fee uint u50)
 
@@ -191,4 +195,63 @@
   (map-set pricing-multipliers dataset-id new-multiplier)
   (ok true)
   ) 
+)
+
+
+(define-map dataset-ratings
+  { dataset-id: uint, user: principal }
+  {
+    rating: uint,
+    review: (string-ascii 200),
+    submitted-at: uint
+  }
+)
+
+(define-map dataset-rating-stats
+  uint
+  {
+    total-ratings: uint,
+    sum-ratings: uint,
+    average-rating: uint
+  }
+)
+
+(define-read-only (get-dataset-rating (dataset-id uint))
+  (default-to 
+    { total-ratings: u0, sum-ratings: u0, average-rating: u0 }
+    (map-get? dataset-rating-stats dataset-id)
+  )
+)
+
+(define-read-only (get-user-rating (dataset-id uint) (user principal))
+  (map-get? dataset-ratings { dataset-id: dataset-id, user: user })
+)
+
+(define-public (rate-dataset (dataset-id uint) (rating uint) (review (string-ascii 200)))
+  (let (
+    (dataset-info (unwrap! (map-get? datasets dataset-id) err-dataset-not-found))
+    (user-access (unwrap! (map-get? dataset-access { dataset-id: dataset-id, user: tx-sender }) err-no-access-history))
+    (existing-rating (map-get? dataset-ratings { dataset-id: dataset-id, user: tx-sender }))
+    (current-stats (get-dataset-rating dataset-id))
+  )
+  (asserts! (is-none existing-rating) err-already-rated)
+  (asserts! (and (>= rating u1) (<= rating u5)) err-invalid-rating)
+  (map-set dataset-ratings { dataset-id: dataset-id, user: tx-sender } {
+    rating: rating,
+    review: review,
+    submitted-at: stacks-block-height
+  })
+  (let (
+    (new-total (+ (get total-ratings current-stats) u1))
+    (new-sum (+ (get sum-ratings current-stats) rating))
+    (new-average (/ (* new-sum u100) new-total))
+  )
+  (map-set dataset-rating-stats dataset-id {
+    total-ratings: new-total,
+    sum-ratings: new-sum,
+    average-rating: new-average
+  })
+  )
+  (ok true)
+  )
 )
