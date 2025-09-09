@@ -10,6 +10,11 @@
 (define-constant err-invalid-rating (err u107))
 (define-constant err-no-access-history (err u108))
 
+(define-constant err-subscription-not-found (err u109))
+(define-constant err-subscription-exists (err u110))
+(define-constant err-subscription-expired (err u111))
+(define-constant err-invalid-plan (err u112))
+
 (define-data-var next-dataset-id uint u1)
 (define-data-var platform-fee uint u50)
 
@@ -252,6 +257,103 @@
     average-rating: new-average
   })
   )
+  (ok true)
+  )
+)
+
+
+(define-map subscription-plans
+  { dataset-id: uint, plan-type: (string-ascii 20) }
+  {
+    price-per-period: uint,
+    period-duration: uint,
+    max-subscribers: uint,
+    current-subscribers: uint,
+    is-active: bool
+  }
+)
+
+(define-map user-subscriptions
+  { dataset-id: uint, user: principal }
+  {
+    plan-type: (string-ascii 20),
+    subscribed-at: uint,
+    last-payment: uint,
+    next-payment-due: uint,
+    auto-renew: bool,
+    is-active: bool
+  }
+)
+
+(define-read-only (get-subscription-plan (dataset-id uint) (plan-type (string-ascii 20)))
+  (map-get? subscription-plans { dataset-id: dataset-id, plan-type: plan-type })
+)
+
+(define-read-only (get-user-subscription (dataset-id uint) (user principal))
+  (map-get? user-subscriptions { dataset-id: dataset-id, user: user })
+)
+
+(define-read-only (has-active-subscription (dataset-id uint) (user principal))
+  (match (map-get? user-subscriptions { dataset-id: dataset-id, user: user })
+    sub-info
+    (and (get is-active sub-info) (> (get next-payment-due sub-info) stacks-block-height))
+    false
+  )
+)
+
+(define-public (create-subscription-plan (dataset-id uint) (plan-type (string-ascii 20)) (price-per-period uint) (period-duration uint) (max-subscribers uint))
+  (let (
+    (dataset-info (unwrap! (map-get? datasets dataset-id) err-dataset-not-found))
+  )
+  (asserts! (is-eq tx-sender (get owner dataset-info)) err-unauthorized)
+  (asserts! (> price-per-period u0) err-invalid-price)
+  (asserts! (> period-duration u0) err-invalid-plan)
+  (map-set subscription-plans { dataset-id: dataset-id, plan-type: plan-type } {
+    price-per-period: price-per-period,
+    period-duration: period-duration,
+    max-subscribers: max-subscribers,
+    current-subscribers: u0,
+    is-active: true
+  })
+  (ok true)
+  )
+)
+
+(define-public (subscribe-to-dataset (dataset-id uint) (plan-type (string-ascii 20)) (auto-renew bool))
+  (let (
+    (plan (unwrap! (map-get? subscription-plans { dataset-id: dataset-id, plan-type: plan-type }) err-invalid-plan))
+    (user-balance (get-user-balance tx-sender))
+    (subscription-cost (get price-per-period plan))
+    (existing-sub (map-get? user-subscriptions { dataset-id: dataset-id, user: tx-sender }))
+  )
+  (asserts! (get is-active plan) err-invalid-plan)
+  (asserts! (is-none existing-sub) err-subscription-exists)
+  (asserts! (< (get current-subscribers plan) (get max-subscribers plan)) err-invalid-plan)
+  (asserts! (>= user-balance subscription-cost) err-insufficient-payment)
+  (map-set user-balances tx-sender (- user-balance subscription-cost))
+  (map-set user-subscriptions { dataset-id: dataset-id, user: tx-sender } {
+    plan-type: plan-type,
+    subscribed-at: stacks-block-height,
+    last-payment: stacks-block-height,
+    next-payment-due: (+ stacks-block-height (get period-duration plan)),
+    auto-renew: auto-renew,
+    is-active: true
+  })
+  (map-set subscription-plans { dataset-id: dataset-id, plan-type: plan-type }
+    (merge plan { current-subscribers: (+ (get current-subscribers plan) u1) }))
+  (ok true)
+  )
+)
+
+(define-public (cancel-subscription (dataset-id uint))
+  (let (
+    (subscription (unwrap! (map-get? user-subscriptions { dataset-id: dataset-id, user: tx-sender }) err-subscription-not-found))
+    (plan (unwrap! (map-get? subscription-plans { dataset-id: dataset-id, plan-type: (get plan-type subscription) }) err-invalid-plan))
+  )
+  (map-set user-subscriptions { dataset-id: dataset-id, user: tx-sender }
+    (merge subscription { auto-renew: false, is-active: false }))
+  (map-set subscription-plans { dataset-id: dataset-id, plan-type: (get plan-type subscription) }
+    (merge plan { current-subscribers: (- (get current-subscribers plan) u1) }))
   (ok true)
   )
 )
