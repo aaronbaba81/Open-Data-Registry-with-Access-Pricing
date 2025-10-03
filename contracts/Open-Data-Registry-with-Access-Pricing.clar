@@ -15,6 +15,10 @@
 (define-constant err-subscription-expired (err u111))
 (define-constant err-invalid-plan (err u112))
 
+(define-constant err-invalid-referral (err u113))
+(define-constant err-self-referral (err u114))
+(define-constant referral-reward-percentage u200)
+
 (define-data-var next-dataset-id uint u1)
 (define-data-var platform-fee uint u50)
 
@@ -354,6 +358,94 @@
     (merge subscription { auto-renew: false, is-active: false }))
   (map-set subscription-plans { dataset-id: dataset-id, plan-type: (get plan-type subscription) }
     (merge plan { current-subscribers: (- (get current-subscribers plan) u1) }))
+  (ok true)
+  )
+)
+
+(define-map referral-codes
+  principal
+  {
+    code: (string-ascii 20),
+    total-referrals: uint,
+    total-earnings: uint,
+    is-active: bool
+  }
+)
+
+(define-map referral-relationships
+  { dataset-id: uint, buyer: principal }
+  {
+    referrer: principal,
+    reward-paid: uint,
+    purchased-at: uint
+  }
+)
+
+(define-read-only (get-referral-code (user principal))
+  (map-get? referral-codes user)
+)
+
+(define-read-only (get-referral-stats (user principal))
+  (default-to 
+    { code: "", total-referrals: u0, total-earnings: u0, is-active: false }
+    (map-get? referral-codes user)
+  )
+)
+
+(define-public (create-referral-code (code (string-ascii 20)))
+  (begin
+    (asserts! (is-none (map-get? referral-codes tx-sender)) err-dataset-exists)
+    (map-set referral-codes tx-sender {
+      code: code,
+      total-referrals: u0,
+      total-earnings: u0,
+      is-active: true
+    })
+    (ok true)
+  )
+)
+
+(define-public (purchase-with-referral (dataset-id uint) (duration uint) (referrer principal))
+  (let (
+    (dataset-info (unwrap! (map-get? datasets dataset-id) err-dataset-not-found))
+    (current-price (get-current-price dataset-id))
+    (user-balance (get-user-balance tx-sender))
+    (platform-fee-amount (/ (* current-price (var-get platform-fee)) u1000))
+    (referral-reward (/ (* platform-fee-amount referral-reward-percentage) u1000))
+    (platform-net-fee (- platform-fee-amount referral-reward))
+    (owner-payment (- current-price platform-fee-amount))
+    (referrer-info (unwrap! (map-get? referral-codes referrer) err-invalid-referral))
+  )
+  (asserts! (get is-active dataset-info) err-dataset-not-found)
+  (asserts! (not (is-eq tx-sender referrer)) err-self-referral)
+  (asserts! (get is-active referrer-info) err-invalid-referral)
+  (asserts! (has-valid-access dataset-id referrer) err-invalid-referral)
+  (asserts! (>= user-balance current-price) err-insufficient-payment)
+  (map-set user-balances tx-sender (- user-balance current-price))
+  (map-set user-balances (get owner dataset-info) 
+    (+ (get-user-balance (get owner dataset-info)) owner-payment))
+  (map-set user-balances contract-owner 
+    (+ (get-user-balance contract-owner) platform-net-fee))
+  (map-set user-balances referrer 
+    (+ (get-user-balance referrer) referral-reward))
+  (map-set dataset-access { dataset-id: dataset-id, user: tx-sender } {
+    purchased-at: stacks-block-height,
+    expires-at: (+ stacks-block-height duration),
+    access-level: "full"
+  })
+  (map-set datasets dataset-id 
+    (merge dataset-info { access-count: (+ (get access-count dataset-info) u1) }))
+  (map-set referral-codes referrer
+    (merge referrer-info { 
+      total-referrals: (+ (get total-referrals referrer-info) u1),
+      total-earnings: (+ (get total-earnings referrer-info) referral-reward)
+    }))
+  (map-set referral-relationships { dataset-id: dataset-id, buyer: tx-sender } {
+    referrer: referrer,
+    reward-paid: referral-reward,
+    purchased-at: stacks-block-height
+  })
+  (try! (update-pricing-multiplier dataset-id))
   (ok true)
   )
 )
