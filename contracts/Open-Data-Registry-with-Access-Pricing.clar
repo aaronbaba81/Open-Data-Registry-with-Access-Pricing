@@ -19,6 +19,13 @@
 (define-constant err-self-referral (err u114))
 (define-constant referral-reward-percentage u200)
 
+(define-constant err-bundle-not-found (err u115))
+(define-constant err-bundle-exists (err u116))
+(define-constant err-not-dataset-owner (err u117))
+(define-constant err-invalid-bundle-size (err u118))
+
+(define-data-var next-bundle-id uint u1)
+
 (define-data-var next-dataset-id uint u1)
 (define-data-var platform-fee uint u50)
 
@@ -447,5 +454,133 @@
   })
   (try! (update-pricing-multiplier dataset-id))
   (ok true)
+  )
+)
+
+(define-map dataset-bundles
+  uint
+  {
+    creator: principal,
+    title: (string-ascii 100),
+    description: (string-ascii 300),
+    discount-percentage: uint,
+    is-active: bool,
+    created-at: uint,
+    total-purchases: uint
+  }
+)
+
+(define-map bundle-datasets
+  { bundle-id: uint, dataset-id: uint }
+  bool
+)
+
+(define-map bundle-purchases
+  { bundle-id: uint, user: principal }
+  {
+    purchased-at: uint,
+    total-paid: uint
+  }
+)
+
+(define-read-only (get-bundle (bundle-id uint))
+  (map-get? dataset-bundles bundle-id)
+)
+
+(define-read-only (is-dataset-in-bundle (bundle-id uint) (dataset-id uint))
+  (default-to false (map-get? bundle-datasets { bundle-id: bundle-id, dataset-id: dataset-id }))
+)
+
+(define-read-only (get-bundle-price (bundle-id uint) (dataset-list (list 10 uint)))
+  (fold calculate-bundle-total dataset-list { total: u0, discount: u0, valid: true })
+)
+
+(define-private (calculate-bundle-total (dataset-id uint) (acc { total: uint, discount: uint, valid: bool }))
+  (if (get valid acc)
+    (let (
+      (price (get-current-price dataset-id))
+    )
+    { total: (+ (get total acc) price), discount: (get discount acc), valid: true }
+    )
+    acc
+  )
+)
+
+(define-public (create-bundle (title (string-ascii 100)) (description (string-ascii 300)) (dataset-list (list 10 uint)) (discount-percentage uint))
+  (let (
+    (bundle-id (var-get next-bundle-id))
+  )
+  (asserts! (and (>= discount-percentage u5) (<= discount-percentage u50)) err-invalid-price)
+  (asserts! (> (len dataset-list) u1) err-invalid-bundle-size)
+  (asserts! (fold check-dataset-owner dataset-list true) err-not-dataset-owner)
+  (map-set dataset-bundles bundle-id {
+    creator: tx-sender,
+    title: title,
+    description: description,
+    discount-percentage: discount-percentage,
+    is-active: true,
+    created-at: stacks-block-height,
+    total-purchases: u0
+  })
+  (begin
+    (fold register-dataset-to-bundle dataset-list bundle-id)
+    (var-set next-bundle-id (+ bundle-id u1))
+  )
+  (ok bundle-id)
+  )
+)
+
+(define-private (check-dataset-owner (dataset-id uint) (is-valid bool))
+  (if is-valid
+    (match (map-get? datasets dataset-id)
+      dataset-info
+      (is-eq tx-sender (get owner dataset-info))
+      false
+    )
+    false
+  )
+)
+
+(define-private (register-dataset-to-bundle (dataset-id uint) (bundle-id uint))
+  (begin
+    (map-set bundle-datasets { bundle-id: bundle-id, dataset-id: dataset-id } true)
+    bundle-id
+  )
+)
+
+(define-public (purchase-bundle (bundle-id uint) (dataset-list (list 10 uint)) (duration uint))
+  (let (
+    (bundle-info (unwrap! (map-get? dataset-bundles bundle-id) err-bundle-not-found))
+    (base-total (fold sum-dataset-prices dataset-list u0))
+    (discount-amount (/ (* base-total (get discount-percentage bundle-info)) u100))
+    (final-price (- base-total discount-amount))
+    (user-balance (get-user-balance tx-sender))
+  )
+  (asserts! (get is-active bundle-info) err-bundle-not-found)
+  (asserts! (>= user-balance final-price) err-insufficient-payment)
+  (map-set user-balances tx-sender (- user-balance final-price))
+  (fold grant-single-access dataset-list duration)
+  (map-set bundle-purchases { bundle-id: bundle-id, user: tx-sender } {
+    purchased-at: stacks-block-height,
+    total-paid: final-price
+  })
+  (map-set dataset-bundles bundle-id 
+    (merge bundle-info { total-purchases: (+ (get total-purchases bundle-info) u1) }))
+  (ok final-price)
+  )
+)
+
+(define-private (sum-dataset-prices (dataset-id uint) (total uint))
+  (+ total (get-current-price dataset-id))
+)
+
+(define-private (grant-single-access (dataset-id uint) (dur uint))
+  (begin
+    (map-set dataset-access { dataset-id: dataset-id, user: tx-sender } {
+      purchased-at: stacks-block-height,
+      expires-at: (+ stacks-block-height dur),
+      access-level: "bundle"
+    })
+    dur
   )
 )
